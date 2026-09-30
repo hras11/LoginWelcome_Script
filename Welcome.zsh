@@ -1,63 +1,102 @@
+#!/usr/bin/env zsh
+# SSH 登录欢迎横幅（zsh）。
+# 必须用 source（或 `.`）引入，`ZLOGIN_SOURCED` 去重标记才能生效；
+# 写成 `zsh Welcome.zsh` 或只在 .zshrc 里放一个裸路径，都会在子 shell 执行，标记随进程退出而丢失。
+
 if [ -n "$SSH_CONNECTION" ] && [ -z "$ZLOGIN_SOURCED" ]; then
     export ZLOGIN_SOURCED=1
-    
-    echo ""
-    echo "=========================================="
-    
-    # 【终极防截断逻辑】优先从 systemd 日志提取，完美支持完整 IPv6 喵！
-    # 注意：Debian 系统中 SSH 服务名通常为 ssh.service 而不是 sshd.service 喵~
-    LAST_LOG=$(journalctl -u ssh.service --grep="Accepted.*for $USER" -n 1 --no-pager -q -o short-iso 2>/dev/null | tail -n 1)
-    
-    # 如果 journalctl 没权限或没找到，优雅回退到传统的 /var/log/auth.log 喵~
-    if [ -z "$LAST_LOG" ]; then
-        LAST_LOG=$(grep "Accepted.*for $USER" /var/log/auth.log 2>/dev/null | tail -n 1)
-    fi
-    
-    if [ -n "$LAST_LOG" ]; then
-        # 智能判断日志来源格式并提取时间
-        if echo "$LAST_LOG" | grep -q "T[0-9][0-9]:[0-9][0-9]"; then
-            # journalctl 格式: 2026-08-25T05:57:07+08:00 -> 转换为 2026-08-25 05:57:07
-            LAST_TIME=$(echo "$LAST_LOG" | awk '{print $1}' | sed 's/T/ /; s/[+-].*//')
-        else
-            # auth.log 格式: Aug 25 05:57:07
-            LAST_TIME=$(echo "$LAST_LOG" | awk '{print $1, $2, $3}')
+
+    # 包一层函数：所有临时变量随函数结束销毁，不污染交互 shell 的环境。
+    _lw_show() {
+        local me current_ip last_log last_time last_ip f info awk_prev
+        me=${USER:-${LOGNAME:-$(id -un)}}
+        current_ip=$(echo "${SSH_CLIENT:-$SSH_CONNECTION}" | awk '{print $1}')
+
+        # 从一列「由旧到新」的 Accepted 日志里，取属于本用户的倒数第二条。
+        # 倒数第一条就是本次登录（sshd 在启动 shell 之前已写好这条日志），
+        # 所以只看最后一条会把「本次」当成「上次」显示。
+        # 用户名按整字段比较，避免 alice 命中 alice2。
+        awk_prev='
+            {
+                u = ""
+                for (i = 1; i < NF - 1; i++)
+                    if ($i == "for" && $(i + 2) == "from") u = $(i + 1)
+                if (u == me) line[++n] = $0
+            }
+            END { if (n >= 2) print line[n - 1] }
+        '
+
+        echo ""
+        echo "=========================================="
+
+        last_log=""
+
+        # ── 数据源 1：systemd journal ────────────────────────────────
+        # Debian/Ubuntu 的单元名是 ssh.service，RHEL/Arch/openSUSE 是 sshd.service，两个都给上。
+        # --grep 里 "for 用户名 from" 前后带空格，等价于精确匹配；-n 20 给降级留足窗口。
+        last_log=$(journalctl -u ssh.service -u sshd.service \
+            --grep="Accepted .* for $me from" -n 20 --no-pager -q -o short-iso 2>/dev/null |
+            awk -v me="$me" "$awk_prev")
+
+        # ── 数据源 2：传统 syslog 文件（无权读 journal 或没有 systemd 时） ──
+        if [ -z "$last_log" ]; then
+            for f in /var/log/auth.log /var/log/secure; do
+                [ -r "$f" ] || continue
+                last_log=$(grep " for $me from" "$f" 2>/dev/null | awk -v me="$me" "$awk_prev")
+                [ -n "$last_log" ] && break
+            done
         fi
-        
-        # 提取 IP (精准定位 "from" 关键字后的字段，IPv4/IPv6 通吃，绝不截断喵！)
-        LAST_IP=$(echo "$LAST_LOG" | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}')
-        
-        echo "上次登录: $LAST_TIME"
-        echo "来源 IP : $LAST_IP"
-    else
-        # 【最终回退】如果日志都读不到，才使用 last 命令 (加上 -w 参数尽量防止截断)
-        LAST_INFO=$(last -w -n 50 "$USER" 2>/dev/null | awk -v user="$USER" '$1 == user && $0 !~ /still logged in/ && $0 !~ /wtmp begins/ {print; exit}')
-        
-        if [ -n "$LAST_INFO" ]; then
-            LAST_IP=$(echo "$LAST_INFO" | awk '{print $3}')
-            LAST_TIME=$(echo "$LAST_INFO" | awk '{
-                for(i=4; i<=NF; i++) {
-                    if ($i == "-" || $i == "down" || $i == "still") break;
-                    printf "%s ", $i;
-                }
-                print ""
-            }' | sed 's/ *$//')
-            
-            # 智能检测：如果 IP 长度正好是 16 且包含多个冒号，说明被 last 命令截断了喵！
-            if [ "${#LAST_IP}" -eq 16 ] && [[ "$LAST_IP" == *":"*":"* ]]; then
-                LAST_IP="$LAST_IP (可能被截断)"
+
+        last_time=""
+        last_ip=""
+
+        if [ -n "$last_log" ]; then
+            # journalctl 的 short-iso 时间戳固定在行首 19 个字符：YYYY-MM-DDTHH:MM:SS
+            # （常见写法 sed 's/[+-].*//' 会从日期里的第一个 "-" 开始删，结果只剩 "2026"）
+            case $last_log in
+                *[0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*)
+                    last_time=$(echo "$last_log" | cut -c1-19 | tr 'T' ' ')
+                    ;;
+                *)
+                    # syslog 格式：Aug 25 05:57:07（不带年份）
+                    last_time=$(echo "$last_log" | awk '{print $1, $2, $3}')
+                    ;;
+            esac
+            # "from" 后一个字段就是 IP，IPv4 / IPv6 都完整
+            last_ip=$(echo "$last_log" | awk '{for (i = 1; i < NF; i++) if ($i == "from") { print $(i + 1); exit }}')
+        else
+            # ── 数据源 3：wtmp（last）───────────────────────────────
+            # -i 直接输出数值 IP 不做反解，-w 不截断主机列，-F 带上完整年份。
+            info=$(last -Fiw -n 50 "$me" 2>/dev/null |
+                awk -v user="$me" '$1 == user && $0 !~ /still logged in/ && $0 !~ /^wtmp begins/ { print; exit }')
+
+            if [ -n "$info" ]; then
+                last_ip=$(echo "$info" | awk '{print $3}')
+                last_time=$(echo "$info" | awk '{
+                    for (i = 4; i <= NF; i++) {
+                        if ($i == "-" || $i == "down" || $i == "still") break
+                        printf "%s ", $i
+                    }
+                }' | sed 's/ *$//')
             fi
-            
-            echo "上次登录: $LAST_TIME"
-            echo "来源 IP : $LAST_IP"
-        else
-            echo "没有查询到上次登录日志喵~"
         fi
-    fi
-    
-    # 获取当前真实来源 IP
-    CURRENT_IP=$(echo "$SSH_CLIENT" | awk '{print $1}')
-    echo "当前来源: $CURRENT_IP"
-    echo "当前时间: $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "Ciallo～(∠・ω< )⌒★"
-    echo "=========================================="
+
+        if [ -n "$last_ip" ]; then
+            echo "上次登录: $last_time"
+            echo "来源 IP : $last_ip"
+        elif [ -n "$current_ip" ]; then
+            echo "上次登录: 没有可查询的历史记录（可能是首次登录，或当前用户无权限读取登录日志）"
+        else
+            echo "上次登录: 没有查询到上次登录日志喵~"
+        fi
+
+        # 本次连接的真实来源与时间
+        echo "当前来源: ${current_ip:-未知}"
+        echo "当前时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Ciallo～(∠・ω< )⌒★"
+        echo "=========================================="
+    }
+
+    _lw_show
+    unfunction _lw_show
 fi
